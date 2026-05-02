@@ -1,0 +1,8 @@
+# Environment Variables
+.bionixdb/
+__pycache__
+
+# Google Drive Authentication
+credentials.json
+quickstart.py
+token.json
