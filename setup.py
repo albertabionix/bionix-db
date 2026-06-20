@@ -9,6 +9,8 @@ setup(
     author='Lance Quinto',
     packages=find_packages(where='src'), # Specifies where to look for packages
     package_dir={'': 'src'}, # Tells setuptools that packages are under src
+    package_data={'bionix_db': ['credentials.json']}, # Bundle the shared OAuth client secret
+    include_package_data=True,
     install_requires=[
         "numpy",
         "pandas",
