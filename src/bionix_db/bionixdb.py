@@ -46,6 +46,10 @@ ACTION_NAMES = {
     Action.STAIRS:     "stairs",
 }
 
+# Reverse of ACTION_NAMES, for callers (e.g. EMG-IMU's Flask backend) that receive the
+# string token over the wire and need the Action enum member back.
+ACTION_BY_NAME = {name: action for action, name in ACTION_NAMES.items()}
+
 # OAuth client secret bundled with the package itself, so individual installs don't each
 # need their own Google Cloud project. This only identifies the app to Google — it does not
 # grant Drive access by itself; every user still authenticates with their own Google login,
@@ -128,14 +132,21 @@ class BionixDB:
                 self.service = service_temp
 
                 if require_content_manager:
-                    permissions = service_temp.permissions().list(fileId=BIONIX_DRIVE_ID, supportsAllDrives=True).execute()
+                    permissions = service_temp.permissions().list(
+                        fileId=BIONIX_DRIVE_ID, supportsAllDrives=True,
+                        fields="permissions(emailAddress,role)",
+                    ).execute()
                     for perm in permissions.get('permissions', []):
                         if perm.get('emailAddress') == email and perm.get('role') in ['organizer', 'fileOrganizer']:
                             self.access = Access.CONTENT_MANAGER
                             print(f"Authenticated as {email} with CONTENT_MANAGER access")
                             return
-                    print(f"Authenticated as {email} with CONTRIBUTOR access (upload permissions not granted)")
-                    return
+
+                    self.access = Access.CONTRIBUTOR
+                    print(f"Access denied for {email} — CONTENT_MANAGER access required")
+                    raise PermissionError(
+                        f"Authenticated as {email}, but CONTENT_MANAGER access is required and not granted."
+                    )
 
                 print(f"Authenticated as {email}")
                 return

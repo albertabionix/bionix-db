@@ -130,6 +130,87 @@ def test_query_files_filters_by_action_and_trial(monkeypatch, emg_files):
 
 
 # ---------------------------------------------------------------------------
+# authenticate_user
+# ---------------------------------------------------------------------------
+
+def make_unauthenticated_db() -> BionixDB:
+    """Build a BionixDB with a real (unstubbed) authenticate_user, for testing it directly."""
+    db = BionixDB.__new__(BionixDB)
+    db.creds = None
+    db.service = None
+    db.access = Access.NONE
+    db.credentials_file = "credentials.json"
+    db.token_file = "token.json"
+    return db
+
+
+def stub_oauth(monkeypatch, *, email, permissions):
+    fake_creds = MagicMock(valid=True)
+    monkeypatch.setattr(bionixdb, "authenticate", lambda *a, **k: fake_creds)
+    monkeypatch.setattr(bionixdb, "list_shared_drives", lambda service: [{"id": bionixdb.BIONIX_DRIVE_ID, "name": "Alberta Bionix"}])
+
+    fake_service = MagicMock()
+    fake_service.about.return_value.get.return_value.execute.return_value = {
+        "user": {"emailAddress": email}
+    }
+    fake_service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": permissions
+    }
+    monkeypatch.setattr(bionixdb, "build_service", lambda creds: fake_service)
+    return fake_service
+
+
+def test_authenticate_user_grants_content_manager_when_role_matches(monkeypatch):
+    fake_service = stub_oauth(
+        monkeypatch,
+        email="ciquinto@ualberta.ca",
+        permissions=[{"emailAddress": "ciquinto@ualberta.ca", "role": "fileOrganizer"}],
+    )
+
+    db = make_unauthenticated_db()
+    db.authenticate_user(db.credentials_file, db.token_file, require_content_manager=True)
+
+    assert db.access == Access.CONTENT_MANAGER
+
+    # Regression guard: the permissions().list() call must request emailAddress/role
+    # explicitly. Drive's default partial response omits emailAddress entirely, which
+    # silently broke the role match above for every account, not just unmatched ones.
+    list_kwargs = fake_service.permissions.return_value.list.call_args.kwargs
+    assert "emailAddress" in list_kwargs.get("fields", "")
+
+
+def test_authenticate_user_rejects_contributor_when_content_manager_required(monkeypatch):
+    stub_oauth(
+        monkeypatch,
+        email="ciquinto@ualberta.ca",
+        permissions=[{"emailAddress": "ciquinto@ualberta.ca", "role": "writer"}],
+    )
+
+    db = make_unauthenticated_db()
+    with pytest.raises(PermissionError):
+        db.authenticate_user(db.credentials_file, db.token_file, require_content_manager=True)
+
+    assert db.access == Access.CONTRIBUTOR  # access level is still recorded, just not sufficient
+
+
+def test_authenticate_user_rejects_non_member_account(monkeypatch, tmp_path):
+    monkeypatch.setattr(bionixdb, "authenticate", lambda *a, **k: MagicMock(valid=True))
+    monkeypatch.setattr(bionixdb, "build_service", lambda creds: MagicMock())
+    monkeypatch.setattr(bionixdb, "list_shared_drives", lambda service: [])
+
+    token_file = tmp_path / "token.json"
+    token_file.write_text("{}")
+
+    db = make_unauthenticated_db()
+    db.token_file = str(token_file)
+
+    with pytest.raises(PermissionError):
+        db.authenticate_user(db.credentials_file, db.token_file, require_content_manager=True)
+
+    assert not token_file.exists()  # wrong-account token must be deleted, not reused
+
+
+# ---------------------------------------------------------------------------
 # upload() access gating and trial-number assignment
 # ---------------------------------------------------------------------------
 
