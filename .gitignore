@@ -11,3 +11,6 @@ token.json
 
 # Bundled OAuth client shipped with the package itself — intentionally tracked.
 !src/bionix_db/credentials.json
+
+# Virtual Environment
+venv/

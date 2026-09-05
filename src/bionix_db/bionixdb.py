@@ -9,10 +9,10 @@ from googleapiclient.errors import HttpError
 
 from .oauth import authenticate, build_service, list_shared_drives, list_files_in_shared_drive
 
-# File Naming: {modality}-{pid}-{action}-{trial}.csv
-# trial is a zero-padded, auto-incrementing count of existing trials for the
-# same modality/pid/action — assigned by upload(), not chosen by the caller.
-# Example: emg-p001-walking-01.csv
+# File Naming: {modality}-{pid}-{action}-{exercise?}-{trial}.csv
+# `exercise` is optional but preferred for multi-phase actions. Trial numbers are
+# zero-padded and auto-increment for the same modality/pid/action/exercise.
+# Example: emg-p001-walking-r_leg-01.csv
 # Example: emg-p001-sitstand-01.csv
 
 # File Structure:
@@ -158,57 +158,69 @@ class BionixDB:
 
         raise PermissionError("Failed to authenticate with a valid Bionix account.")
 
-    def get(self, modality: str, pid=None, action=None, trial=None) -> pd.DataFrame:
+    def get(self, modality: str, pid=None, action=None, trial=None, exercise=None) -> pd.DataFrame:
         self._validate_modality(modality)
-        files = self._query_files(MODALITY_FOLDERS[modality], modality, pid=pid, action=action, trial=trial)
+        files = self._query_files(MODALITY_FOLDERS[modality], modality, pid=pid, action=action, trial=trial, exercise=exercise)
         return self._load_files(files)
 
-    def get_emg(self, pid=None, action=None, trial=None) -> pd.DataFrame:
-        return self.get("emg", pid=pid, action=action, trial=trial)
+    def get_emg(self, pid=None, action=None, trial=None, exercise=None) -> pd.DataFrame:
+        return self.get("emg", pid=pid, action=action, trial=trial, exercise=exercise)
 
-    def get_imu(self, pid=None, action=None, trial=None) -> pd.DataFrame:
-        return self.get("imu", pid=pid, action=action, trial=trial)
+    def get_imu(self, pid=None, action=None, trial=None, exercise=None) -> pd.DataFrame:
+        return self.get("imu", pid=pid, action=action, trial=trial, exercise=exercise)
 
-    def get_cvkas(self, pid=None, action=None, trial=None) -> pd.DataFrame:
-        return self.get("cvkas", pid=pid, action=action, trial=trial)
+    def get_cvkas(self, pid=None, action=None, trial=None, exercise=None) -> pd.DataFrame:
+        return self.get("cvkas", pid=pid, action=action, trial=trial, exercise=exercise)
 
-    def get_session(self, pid, action, trial=None) -> dict[str, pd.DataFrame]:
+    def get_session(self, pid, action, trial=None, exercise=None) -> dict[str, pd.DataFrame]:
         """Return {modality: DataFrame} for whichever modalities have a file
-        matching this pid/action/trial. Modalities with no matching file are
+        matching this pid/action/trial/exercise. Modalities with no matching file are
         simply omitted — a session need not include all three.
         """
         if trial is None:
-            trial = self._latest_trial(pid, action)
+            trial = self._latest_trial(pid, action, exercise=exercise)
             if trial is None:
                 return {}
 
         results = {}
         for modality, folder_id in MODALITY_FOLDERS.items():
-            files = self._query_files(folder_id, modality, pid=pid, action=action, trial=trial)
+            files = self._query_files(folder_id, modality, pid=pid, action=action, trial=trial, exercise=exercise)
             if files:
                 results[modality] = self._load_files(files)
         return results
 
     # FSRs, Knee encoder, Other sensor data?
 
-    def _query_files(self, folder_id: str, modality: str, pid=None, action=None, trial=None) -> list[dict]:
+    def _query_files(self, folder_id: str, modality: str, pid=None, action=None, trial=None, exercise=None) -> list[dict]:
         all_files = list_files_in_shared_drive(self.service, BIONIX_DRIVE_ID, folder_id)
 
         matches = []
         for f in all_files:
-            # Expected filename format: {modality}-{pid}-{action}-{trial}
-            # Any file that doesn't match exactly 4 parts is not a dataset file.
-            parts = f['name'].removesuffix('.csv').split('-')
-            if len(parts) != 4 or parts[0] != modality:
+            name = f['name'].removesuffix('.csv')
+            parts = name.split('-')
+            if len(parts) not in (4, 5):
                 continue
-            if pid is not None:
-                if parts[1] != self._format_pid(pid):
+            if parts[0] != modality:
+                continue
+
+            file_pid = parts[1]
+            file_action = parts[2]
+            file_exercise = None
+            file_trial = parts[-1]
+            if len(parts) == 5:
+                file_exercise = parts[3]
+
+            if pid is not None and file_pid != self._format_pid(pid):
+                continue
+            if action is not None and file_action != ACTION_NAMES[action]:
+                continue
+            if exercise is not None:
+                normalized = self._normalize_exercise(exercise)
+                if file_exercise != normalized:
                     continue
-            if action is not None and parts[2] != ACTION_NAMES[action]:
-                continue
             if trial is not None:
                 trial_str = f"{trial:02d}" if isinstance(trial, int) else str(trial)
-                if parts[3] != trial_str:
+                if file_trial != trial_str:
                     continue
             matches.append(f)
 
@@ -218,26 +230,49 @@ class BionixDB:
         if modality not in MODALITY_FOLDERS:
             raise ValueError(f"Unknown modality '{modality}'. Expected one of: {sorted(MODALITY_FOLDERS)}")
 
+    def _normalize_exercise(self, exercise) -> str | None:
+        if exercise is None:
+            return None
+        return str(exercise).strip()
+
     def _format_pid(self, pid) -> str:
         # Accept int (1 -> "p001") or string ("p001") to match the zero-padded convention.
         return f"p{int(pid):03d}" if isinstance(pid, int) else str(pid)
 
-    def _list_trials(self, modality: str, pid, action) -> list[int]:
-        # Existing trial numbers for this modality/pid/action, sorted ascending.
+    def _list_trials(self, modality: str, pid, action, exercise=None) -> list[int]:
+        # Existing trial numbers for this modality/pid/action/exercise, sorted ascending.
         folder_id = MODALITY_FOLDERS[modality]
-        prefix = f"{modality}-{self._format_pid(pid)}-{ACTION_NAMES[action]}-"
         existing = list_files_in_shared_drive(self.service, BIONIX_DRIVE_ID, folder_id)
-        return sorted(
-            int(f["name"][len(prefix):-len(".csv")])
-            for f in existing
-            if f["name"].startswith(prefix) and f["name"][len(prefix):-len(".csv")].isdigit()
-        )
+        trials = []
+        for f in existing:
+            name = f["name"].removesuffix(".csv")
+            parts = name.split('-')
+            if len(parts) not in (4, 5):
+                continue
+            if parts[0] != modality:
+                continue
+            if parts[1] != self._format_pid(pid):
+                continue
+            if parts[2] != ACTION_NAMES[action]:
+                continue
+            file_exercise = parts[3] if len(parts) == 5 else None
+            if exercise is not None:
+                if file_exercise != self._normalize_exercise(exercise):
+                    continue
+            elif file_exercise is not None:
+                # When no specific exercise is requested, include both legacy files and
+                # phase-qualified files in the same action-level trial sequence.
+                pass
+            trial_str = parts[-1]
+            if trial_str.isdigit():
+                trials.append(int(trial_str))
+        return sorted(set(trials))
 
-    def _latest_trial(self, pid, action) -> int | None:
-        # Highest trial number found across any modality for this pid/action, or None if none exist.
+    def _latest_trial(self, pid, action, exercise=None) -> int | None:
+        # Highest trial number found across any modality for this pid/action/exercise, or None if none exist.
         latest = None
         for modality in MODALITY_FOLDERS:
-            trials = self._list_trials(modality, pid, action)
+            trials = self._list_trials(modality, pid, action, exercise=exercise)
             if trials:
                 latest = trials[-1] if latest is None else max(latest, trials[-1])
         return latest
@@ -260,28 +295,28 @@ class BionixDB:
         csv_text = buffer.getvalue().decode("utf-8")
         return pd.read_csv(io.StringIO(csv_text))
 
-    def upload(self, modality: str, csv, pid, action) -> dict:
+    def upload(self, modality: str, csv, pid, action, exercise=None) -> dict:
         self._validate_modality(modality)
         self._check_upload_access()
         csv_path = self._validate_csv_path(csv)
 
         # Trial number is the next one after the highest existing trial for this
-        # modality/pid/action — the caller never has to track or pass it in.
-        trials = self._list_trials(modality, pid, action)
+        # modality/pid/action/exercise — the caller never has to track or pass it in.
+        trials = self._list_trials(modality, pid, action, exercise=exercise)
         next_trial = (trials[-1] if trials else 0) + 1
 
-        return self._create_dataset_file(modality, csv_path, pid, action, next_trial)
+        return self._create_dataset_file(modality, csv_path, pid, action, next_trial, exercise=exercise)
 
-    def upload_emg(self, csv, pid, action) -> dict:
-        return self.upload("emg", csv, pid, action)
+    def upload_emg(self, csv, pid, action, exercise=None) -> dict:
+        return self.upload("emg", csv, pid, action, exercise=exercise)
 
-    def upload_imu(self, csv, pid, action) -> dict:
-        return self.upload("imu", csv, pid, action)
+    def upload_imu(self, csv, pid, action, exercise=None) -> dict:
+        return self.upload("imu", csv, pid, action, exercise=exercise)
 
-    def upload_cvkas(self, csv, pid, action) -> dict:
-        return self.upload("cvkas", csv, pid, action)
+    def upload_cvkas(self, csv, pid, action, exercise=None) -> dict:
+        return self.upload("cvkas", csv, pid, action, exercise=exercise)
 
-    def upload_session(self, pid, action, emg=None, imu=None, cvkas=None) -> dict[str, dict]:
+    def upload_session(self, pid, action, emg=None, imu=None, cvkas=None, exercise=None) -> dict[str, dict]:
         """Upload one or more modalities recorded as a single trial, assigning them
         all the same trial number so they stay aligned. Modalities left as None are
         skipped — a session need not include all three.
@@ -294,13 +329,13 @@ class BionixDB:
         csv_paths = {modality: self._validate_csv_path(csv) for modality, csv in provided.items()}
 
         # Shared trial number = next past the highest trial across ALL modality folders
-        # for this pid/action, not just the ones being uploaded now — so a session that
-        # only ever recorded EMG+IMU doesn't end up reusing a trial number CVKAS already took.
-        latest = self._latest_trial(pid, action)
+        # for this pid/action/exercise, not just the ones being uploaded now — so a
+        # session that only ever recorded EMG+IMU doesn't reuse a trial number CVKAS already took.
+        latest = self._latest_trial(pid, action, exercise=exercise)
         next_trial = (latest or 0) + 1
 
         return {
-            modality: self._create_dataset_file(modality, csv_path, pid, action, next_trial)
+            modality: self._create_dataset_file(modality, csv_path, pid, action, next_trial, exercise=exercise)
             for modality, csv_path in csv_paths.items()
         }
 
@@ -319,9 +354,13 @@ class BionixDB:
             raise ValueError(f"Expected a .csv file, got: {csv_path.name}")
         return csv_path
 
-    def _create_dataset_file(self, modality: str, csv_path: Path, pid, action, trial: int) -> dict:
+    def _create_dataset_file(self, modality: str, csv_path: Path, pid, action, trial: int, exercise=None) -> dict:
         folder_id = MODALITY_FOLDERS[modality]
-        filename = f"{modality}-{self._format_pid(pid)}-{ACTION_NAMES[action]}-{trial:02d}.csv"
+        action_name = ACTION_NAMES[action]
+        if exercise is not None:
+            filename = f"{modality}-{self._format_pid(pid)}-{action_name}-{self._normalize_exercise(exercise)}-{trial:02d}.csv"
+        else:
+            filename = f"{modality}-{self._format_pid(pid)}-{action_name}-{trial:02d}.csv"
 
         metadata = {"name": filename, "parents": [folder_id]}
         media = MediaFileUpload(str(csv_path), mimetype="text/csv", resumable=True)
