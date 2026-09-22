@@ -129,6 +129,23 @@ def test_query_files_filters_by_action_and_trial(monkeypatch, emg_files):
     assert [f["id"] for f in matches] == ["2"]
 
 
+def test_query_files_filters_by_exercise_and_preserves_legacy_names(monkeypatch):
+    files = [
+        {"id": "1", "name": "emg-p001-walking-r_leg-01.csv"},
+        {"id": "2", "name": "emg-p001-walking-l_leg-01.csv"},
+        {"id": "3", "name": "emg-p001-sitstand-r_leg-01.csv"},
+        {"id": "4", "name": "emg-p001-walking-01.csv"},
+    ]
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: files)
+    db = make_db()
+
+    matches = db._query_files("folder-id", "emg", action=Action.WALKING, exercise="r_leg")
+    assert [f["id"] for f in matches] == ["1"]
+
+    matches = db._query_files("folder-id", "emg", action=Action.WALKING, exercise=None)
+    assert {f["id"] for f in matches} == {"1", "2", "4"}
+
+
 # ---------------------------------------------------------------------------
 # authenticate_user
 # ---------------------------------------------------------------------------
@@ -258,6 +275,25 @@ def test_upload_assigns_first_trial_when_none_exist(monkeypatch, tmp_path):
     assert result["name"] == "emg-p001-walking-01.csv"
     create_kwargs = db.service.files().create.call_args.kwargs
     assert create_kwargs["body"]["name"] == "emg-p001-walking-01.csv"
+
+
+def test_upload_includes_exercise_in_filename(monkeypatch, tmp_path):
+    csv_path = tmp_path / "local_recording.csv"
+    csv_path.write_text("a,b\n1,2\n")
+
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: [])
+    monkeypatch.setattr(bionixdb, "MediaFileUpload", MagicMock())
+
+    db = make_db(access=Access.CONTENT_MANAGER)
+    db.service.files.return_value.create.return_value.execute.return_value = {
+        "id": "new-id", "name": "emg-p001-walking-r_leg-01.csv", "webViewLink": "http://example.com",
+    }
+
+    result = db.upload("emg", str(csv_path), pid=1, action=Action.WALKING, exercise="r_leg")
+
+    assert result["name"] == "emg-p001-walking-r_leg-01.csv"
+    create_kwargs = db.service.files().create.call_args.kwargs
+    assert create_kwargs["body"]["name"] == "emg-p001-walking-r_leg-01.csv"
 
 
 def test_upload_increments_trial_past_existing(monkeypatch, tmp_path):
