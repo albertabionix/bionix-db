@@ -452,3 +452,154 @@ def test_get_session_returns_empty_dict_when_nothing_exists(monkeypatch):
     db = make_db()
 
     assert db.get_session(pid=1, action=Action.WALKING) == {}
+
+
+# ---------------------------------------------------------------------------
+# Reading: metadata columns, ordering, dtypes, downloads
+# ---------------------------------------------------------------------------
+# Snippets shaped like real EMG-IMU recordings.
+
+EMG_CSV = {
+    "e1": b"timestamp,emg1,emg2\n1788727215.6523619,1331,1316\n1788727215.6553597,1345,1328\n",
+    "e2": b"timestamp,emg1,emg2\n1788727300.1000000,1300,1290\n",
+}
+CVKAS_CSV = (
+    b"timestamp,marker_id,pos_x,pos_y,velocity,acceleration,hip_angle,knee_angle\n"
+    b"1788727215.6523619,3,93.75,160.5,109.9,137.6,,\n"
+    b"1788727215.6523619,2,119.0,110.25,114.8,507.7,,\n"
+    b"1788727215.9173632,,,,,,,\n"
+)
+
+
+def stub_downloads(db, contents):
+    db._download_bytes = MagicMock(side_effect=lambda file_id: contents[file_id])
+
+
+def test_get_adds_metadata_columns_and_keeps_trials_separable(monkeypatch):
+    files = [  # Drive lists newest first; result must still be ordered by trial
+        {"id": "e2", "name": "emg-p020-stairs-stairmaster-04.csv"},
+        {"id": "e1", "name": "emg-p020-stairs-stairmaster-03.csv"},
+    ]
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: files)
+    db = make_db()
+    stub_downloads(db, EMG_CSV)
+
+    df = db.get_emg(pid=20, action=Action.STAIRS)
+
+    assert list(df.columns) == ["pid", "action", "exercise", "trial", "file", "timestamp", "emg1", "emg2"]
+    assert df["trial"].tolist() == [3, 3, 4]
+    assert df["file"].iloc[0] == "emg-p020-stairs-stairmaster-03.csv"
+    assert set(df["pid"]) == {"p020"} and set(df["exercise"]) == {"stairmaster"}
+    assert {t: len(g) for t, g in df.groupby("trial")} == {3: 2, 4: 1}
+    # recorded values and full timestamp precision are untouched
+    assert df["timestamp"].iloc[0] == 1788727215.6523619
+    assert df["emg1"].tolist() == [1331, 1345, 1300]
+
+
+def test_get_legacy_file_without_exercise_has_none_exercise(monkeypatch):
+    files = [{"id": "e1", "name": "emg-p001-walking-01.csv"}]
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: files)
+    db = make_db()
+    stub_downloads(db, EMG_CSV)
+
+    df = db.get_emg()
+    assert df["exercise"].isna().all()
+    assert df["trial"].tolist() == [1, 1]
+
+
+def test_get_cvkas_reads_marker_id_as_nullable_int(monkeypatch):
+    files = [{"id": "c1", "name": "cvkas-p020-stairs-stairmaster-03.csv"}]
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: files)
+    db = make_db()
+    stub_downloads(db, {"c1": CVKAS_CSV})
+
+    df = db.get_cvkas()
+    assert str(df["marker_id"].dtype) == "Int64"
+    assert df["marker_id"].tolist()[:2] == [3, 2]
+    assert pd.isna(df["marker_id"].iloc[2])  # frame with no detected markers
+
+
+def test_get_returns_empty_dataframe_when_nothing_matches(monkeypatch):
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: [])
+    assert make_db().get_imu(pid=1).empty
+
+
+def test_download_saves_raw_files_unmodified(monkeypatch, tmp_path):
+    files = [
+        {"id": "e2", "name": "emg-p020-stairs-stairmaster-04.csv"},
+        {"id": "e1", "name": "emg-p020-stairs-stairmaster-03.csv"},
+    ]
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: files)
+    db = make_db()
+    stub_downloads(db, EMG_CSV)
+
+    paths = db.download_emg(tmp_path / "out", pid="p020")
+
+    assert [p.name for p in paths] == ["emg-p020-stairs-stairmaster-03.csv", "emg-p020-stairs-stairmaster-04.csv"]
+    assert paths[0].read_bytes() == EMG_CSV["e1"]
+
+
+def test_action_accepts_filename_token_and_rejects_unknown(monkeypatch, emg_files):
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: emg_files)
+    db = make_db()
+
+    assert [f["id"] for f in db._query_files("folder-id", "emg", action="sitstand")] == ["3"]
+    with pytest.raises(ValueError):
+        db._query_files("folder-id", "emg", action="running")
+
+
+# ---------------------------------------------------------------------------
+# Exercise names containing '-'
+# ---------------------------------------------------------------------------
+
+def test_upload_replaces_dash_in_exercise_so_file_stays_queryable(monkeypatch, tmp_path):
+    csv = tmp_path / "rec.csv"
+    csv.write_text("timestamp,emg1,emg2\n")
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: [])
+    db = make_db()
+    db.service.files.return_value.create.return_value.execute.side_effect = (
+        lambda: {"id": "x", "name": db.service.files.return_value.create.call_args.kwargs["body"]["name"]}
+    )
+
+    result = db.upload_emg(csv, pid=1, action=Action.WALKING, exercise="r-leg")
+    assert result["name"] == "emg-p001-walking-r_leg-01.csv"
+
+
+def test_query_with_dashed_exercise_matches_normalized_name(monkeypatch):
+    files = [{"id": "1", "name": "emg-p001-walking-r_leg-01.csv"}]
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: files)
+    assert [f["id"] for f in make_db()._query_files("folder-id", "emg", exercise="r-leg")] == ["1"]
+
+
+def test_blank_exercise_is_treated_as_none(tmp_path, monkeypatch):
+    csv = tmp_path / "rec.csv"
+    csv.write_text("timestamp,emg1,emg2\n")
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: [])
+    db = make_db()
+    db.service.files.return_value.create.return_value.execute.side_effect = (
+        lambda: {"id": "x", "name": db.service.files.return_value.create.call_args.kwargs["body"]["name"]}
+    )
+
+    assert db.upload_emg(csv, pid=1, action=Action.WALKING, exercise="  ")["name"] == "emg-p001-walking-01.csv"
+
+
+# ---------------------------------------------------------------------------
+# list_files_in_shared_drive pagination
+# ---------------------------------------------------------------------------
+
+def test_list_files_in_shared_drive_follows_all_pages():
+    from bionix_db import oauth
+
+    pages = [
+        {"files": [{"id": "1"}, {"id": "2"}], "nextPageToken": "p2"},
+        {"files": [{"id": "3"}], "nextPageToken": "p3"},
+        {"files": [{"id": "4"}]},
+    ]
+    service = MagicMock()
+    service.files.return_value.list.return_value.execute.side_effect = pages
+
+    files = oauth.list_files_in_shared_drive(service, "drive", "folder")
+
+    assert [f["id"] for f in files] == ["1", "2", "3", "4"]
+    tokens = [c.kwargs["pageToken"] for c in service.files.return_value.list.call_args_list]
+    assert tokens == [None, "p2", "p3"]

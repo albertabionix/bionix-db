@@ -14,3 +14,4 @@ token.json
 
 # Virtual Environment
 venv/
+.DS_Store

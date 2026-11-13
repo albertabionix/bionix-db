@@ -158,10 +158,20 @@ class BionixDB:
 
         raise PermissionError("Failed to authenticate with a valid Bionix account.")
 
+    # -----------------------------------------------------------------------
+    # Reading
+    # -----------------------------------------------------------------------
+    # Every get_* returns ONE DataFrame in "long" form: the recorded columns exactly
+    # as written by the recorder, plus metadata columns (pid, action, exercise,
+    # trial, file) identifying which dataset each row came from. Querying several
+    # trials therefore stays unambiguous — split with df.groupby("trial").
+
+    METADATA_COLUMNS = ("pid", "action", "exercise", "trial", "file")
+
     def get(self, modality: str, pid=None, action=None, trial=None, exercise=None) -> pd.DataFrame:
         self._validate_modality(modality)
         files = self._query_files(MODALITY_FOLDERS[modality], modality, pid=pid, action=action, trial=trial, exercise=exercise)
-        return self._load_files(files)
+        return self._load_files(files, modality)
 
     def get_emg(self, pid=None, action=None, trial=None, exercise=None) -> pd.DataFrame:
         return self.get("emg", pid=pid, action=action, trial=trial, exercise=exercise)
@@ -186,41 +196,70 @@ class BionixDB:
         for modality, folder_id in MODALITY_FOLDERS.items():
             files = self._query_files(folder_id, modality, pid=pid, action=action, trial=trial, exercise=exercise)
             if files:
-                results[modality] = self._load_files(files)
+                results[modality] = self._load_files(files, modality)
         return results
+
+    def download(self, modality: str, dest_dir, pid=None, action=None, trial=None, exercise=None) -> list[Path]:
+        """Save the matching raw CSV files to dest_dir (created if needed), unmodified,
+        under their Drive names. Returns the saved paths. Use this instead of get_*
+        to parse the files yourself or open them in other tools (MATLAB, Excel, ...).
+        """
+        self._validate_modality(modality)
+        files = self._query_files(MODALITY_FOLDERS[modality], modality, pid=pid, action=action, trial=trial, exercise=exercise)
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for f in self._sorted_files(files):
+            dest = dest_dir / f["name"]
+            dest.write_bytes(self._download_bytes(f["id"]))
+            paths.append(dest)
+        return paths
+
+    def download_emg(self, dest_dir, pid=None, action=None, trial=None, exercise=None) -> list[Path]:
+        return self.download("emg", dest_dir, pid=pid, action=action, trial=trial, exercise=exercise)
+
+    def download_imu(self, dest_dir, pid=None, action=None, trial=None, exercise=None) -> list[Path]:
+        return self.download("imu", dest_dir, pid=pid, action=action, trial=trial, exercise=exercise)
+
+    def download_cvkas(self, dest_dir, pid=None, action=None, trial=None, exercise=None) -> list[Path]:
+        return self.download("cvkas", dest_dir, pid=pid, action=action, trial=trial, exercise=exercise)
 
     # FSRs, Knee encoder, Other sensor data?
 
+    @staticmethod
+    def _parse_name(name: str) -> dict | None:
+        """Split '{modality}-{pid}-{action}[-{exercise}]-{trial}.csv' into its parts,
+        or None if the name doesn't follow the convention."""
+        parts = name.removesuffix(".csv").split("-")
+        if len(parts) not in (4, 5):
+            return None
+        return {
+            "modality": parts[0],
+            "pid": parts[1],
+            "action": parts[2],
+            "exercise": parts[3] if len(parts) == 5 else None,
+            "trial": parts[-1],
+        }
+
     def _query_files(self, folder_id: str, modality: str, pid=None, action=None, trial=None, exercise=None) -> list[dict]:
         all_files = list_files_in_shared_drive(self.service, BIONIX_DRIVE_ID, folder_id)
+        action_name = self._action_name(action) if action is not None else None
+        exercise = self._normalize_exercise(exercise)
 
         matches = []
         for f in all_files:
-            name = f['name'].removesuffix('.csv')
-            parts = name.split('-')
-            if len(parts) not in (4, 5):
+            meta = self._parse_name(f["name"])
+            if meta is None or meta["modality"] != modality:
                 continue
-            if parts[0] != modality:
+            if pid is not None and meta["pid"] != self._format_pid(pid):
                 continue
-
-            file_pid = parts[1]
-            file_action = parts[2]
-            file_exercise = None
-            file_trial = parts[-1]
-            if len(parts) == 5:
-                file_exercise = parts[3]
-
-            if pid is not None and file_pid != self._format_pid(pid):
+            if action_name is not None and meta["action"] != action_name:
                 continue
-            if action is not None and file_action != ACTION_NAMES[action]:
+            if exercise is not None and meta["exercise"] != exercise:
                 continue
-            if exercise is not None:
-                normalized = self._normalize_exercise(exercise)
-                if file_exercise != normalized:
-                    continue
             if trial is not None:
                 trial_str = f"{trial:02d}" if isinstance(trial, int) else str(trial)
-                if file_trial != trial_str:
+                if meta["trial"] != trial_str:
                     continue
             matches.append(f)
 
@@ -231,9 +270,22 @@ class BionixDB:
             raise ValueError(f"Unknown modality '{modality}'. Expected one of: {sorted(MODALITY_FOLDERS)}")
 
     def _normalize_exercise(self, exercise) -> str | None:
+        # '-' separates the fields of a dataset filename, so an exercise containing
+        # one ("r-leg") would make the file unparseable and invisible to every query
+        # and to trial numbering. Store/look it up with '_' instead. Blank -> None.
         if exercise is None:
             return None
-        return str(exercise).strip()
+        exercise = str(exercise).strip().replace("-", "_")
+        return exercise or None
+
+    def _action_name(self, action) -> str:
+        # Accept the Action enum or its filename token ("walking"), e.g. straight
+        # from a form or the command line.
+        if isinstance(action, Action):
+            return ACTION_NAMES[action]
+        if isinstance(action, str) and action in ACTION_BY_NAME:
+            return action
+        raise ValueError(f"Unknown action '{action}'. Expected an Action or one of: {sorted(ACTION_BY_NAME)}")
 
     def _format_pid(self, pid) -> str:
         # Accept int (1 -> "p001") or string ("p001") to match the zero-padded convention.
@@ -241,32 +293,10 @@ class BionixDB:
 
     def _list_trials(self, modality: str, pid, action, exercise=None) -> list[int]:
         # Existing trial numbers for this modality/pid/action/exercise, sorted ascending.
-        folder_id = MODALITY_FOLDERS[modality]
-        existing = list_files_in_shared_drive(self.service, BIONIX_DRIVE_ID, folder_id)
-        trials = []
-        for f in existing:
-            name = f["name"].removesuffix(".csv")
-            parts = name.split('-')
-            if len(parts) not in (4, 5):
-                continue
-            if parts[0] != modality:
-                continue
-            if parts[1] != self._format_pid(pid):
-                continue
-            if parts[2] != ACTION_NAMES[action]:
-                continue
-            file_exercise = parts[3] if len(parts) == 5 else None
-            if exercise is not None:
-                if file_exercise != self._normalize_exercise(exercise):
-                    continue
-            elif file_exercise is not None:
-                # When no specific exercise is requested, include both legacy files and
-                # phase-qualified files in the same action-level trial sequence.
-                pass
-            trial_str = parts[-1]
-            if trial_str.isdigit():
-                trials.append(int(trial_str))
-        return sorted(set(trials))
+        # With no exercise given, legacy and exercise-qualified files share one sequence.
+        files = self._query_files(MODALITY_FOLDERS[modality], modality, pid=pid, action=action, exercise=exercise)
+        trials = {int(t) for t in (self._parse_name(f["name"])["trial"] for f in files) if t.isdigit()}
+        return sorted(trials)
 
     def _latest_trial(self, pid, action, exercise=None) -> int | None:
         # Highest trial number found across any modality for this pid/action/exercise, or None if none exist.
@@ -277,13 +307,46 @@ class BionixDB:
                 latest = trials[-1] if latest is None else max(latest, trials[-1])
         return latest
 
-    def _load_files(self, files: list[dict]) -> pd.DataFrame:
+    def _sorted_files(self, files: list[dict]) -> list[dict]:
+        # Deterministic order (pid, action, exercise, trial) regardless of Drive's
+        # modified-time ordering.
+        def key(f):
+            m = self._parse_name(f["name"])
+            trial = int(m["trial"]) if m["trial"].isdigit() else -1
+            return (m["pid"], m["action"], m["exercise"] or "", trial)
+        return sorted(files, key=key)
+
+    def _load_files(self, files: list[dict], modality: str) -> pd.DataFrame:
         if not files:
             return pd.DataFrame()
-        frames = [self.read_google_csv(f['id']) for f in files]
+
+        frames = []
+        for f in self._sorted_files(files):
+            df = self.read_google_csv(f["id"])
+            meta = self._parse_name(f["name"])
+            trial = int(meta["trial"]) if meta["trial"].isdigit() else meta["trial"]
+            for i, (col, value) in enumerate(
+                [("pid", meta["pid"]), ("action", meta["action"]), ("exercise", meta["exercise"]),
+                 ("trial", trial), ("file", f["name"])]
+            ):
+                df.insert(i, col, value)
+            frames.append(self._fix_dtypes(df, modality))
+
         return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
-    def read_google_csv(self, file_id: str) -> pd.DataFrame:
+    @staticmethod
+    def _fix_dtypes(df: pd.DataFrame, modality: str) -> pd.DataFrame:
+        # CVKAS writes a row with only a timestamp for frames where no marker was
+        # detected, which makes pandas read marker_id as float (3.0, NaN). Keep it an
+        # integer id with missing values instead.
+        if modality == "cvkas" and "marker_id" in df.columns:
+            try:
+                df["marker_id"] = pd.to_numeric(df["marker_id"]).astype("Int64")
+            except (ValueError, TypeError):
+                pass  # non-integer ids: leave as read
+        return df
+
+    def _download_bytes(self, file_id: str) -> bytes:
         request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
         buffer = io.BytesIO()
         downloader = MediaIoBaseDownload(buffer, request)
@@ -291,9 +354,12 @@ class BionixDB:
         done = False
         while not done:
             _, done = downloader.next_chunk()
+        return buffer.getvalue()
 
-        csv_text = buffer.getvalue().decode("utf-8")
-        return pd.read_csv(io.StringIO(csv_text))
+    def read_google_csv(self, file_id: str) -> pd.DataFrame:
+        # round_trip: the default fast parser can change the last digit of
+        # epoch timestamps like 1788727215.6523619.
+        return pd.read_csv(io.BytesIO(self._download_bytes(file_id)), float_precision="round_trip")
 
     def upload(self, modality: str, csv, pid, action, exercise=None) -> dict:
         self._validate_modality(modality)
@@ -356,9 +422,10 @@ class BionixDB:
 
     def _create_dataset_file(self, modality: str, csv_path: Path, pid, action, trial: int, exercise=None) -> dict:
         folder_id = MODALITY_FOLDERS[modality]
-        action_name = ACTION_NAMES[action]
+        action_name = self._action_name(action)
+        exercise = self._normalize_exercise(exercise)
         if exercise is not None:
-            filename = f"{modality}-{self._format_pid(pid)}-{action_name}-{self._normalize_exercise(exercise)}-{trial:02d}.csv"
+            filename = f"{modality}-{self._format_pid(pid)}-{action_name}-{exercise}-{trial:02d}.csv"
         else:
             filename = f"{modality}-{self._format_pid(pid)}-{action_name}-{trial:02d}.csv"
 
