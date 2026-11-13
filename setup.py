@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='bionixdb', # Must be a unique name on PyPI
-    version='0.1.0',
+    version='0.2.0',
     description='Library used to access Alberta Bionix databases.',
     author='Lance Quinto',
     packages=find_packages(where='src'), # Specifies where to look for packages

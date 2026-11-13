@@ -25,6 +25,45 @@ See [example.py](example.py) for end-to-end read and upload examples.
 python example.py
 ```
 
+# Using BionixDB in Another Project
+
+Install a tagged release directly from GitHub. No PyPI or local clone is needed:
+```
+pip install "bionixdb @ git+https://github.com/albertabionix/bionix-db.git@v0.2.0"
+```
+or put this line in the project's `requirements.txt`:
+```
+bionixdb @ git+https://github.com/albertabionix/bionix-db.git@v0.2.0
+```
+Then `from bionix_db import BionixDB`. The bundled OAuth client (`credentials.json`) is installed with the package.
+
+Always pin to a tag (`@v0.2.0`), not `@main`. That way, work in progress on `main` never reaches other projects by accident, and every app release records exactly which BionixDB version it uses.
+
+# Releasing a New Version
+
+Projects that depend on BionixDB, such as [EMG-and-IMU-Data-Collection](https://github.com/albertabionix/EMG-and-IMU-Data-Collection), only get your changes once you publish a new tag and they update their pin.
+
+1. Merge your changes into `main` (tests passing: `pytest tests/`).
+2. In a PR, bump `version` in `setup.py` ([semver](https://semver.org): bug fix `0.2.0 → 0.2.1`, new feature `→ 0.3.0`, breaking API change such as a renamed or removed function or parameter `→ 1.0.0`), then merge it.
+3. Tag the merged commit on `main` and push the tag. The tag must match the `setup.py` version:
+   ```
+   git checkout main && git pull
+   git tag v0.3.0
+   git push origin v0.3.0
+   ```
+4. In each dependent project, change `@v0.2.0` to `@v0.3.0` in `requirements.txt`, run `pip install -r requirements.txt`, test, and merge. For EMG-and-IMU, then cut a new app release so the executables include the update (see its README).
+
+Never move or re-push an existing tag. If a release is broken, fix it and release the next version.
+
+## Testing unreleased changes in a dependent project
+
+To try BionixDB changes in another project before tagging them, temporarily install your local clone over the pinned version, from that project's venv:
+```
+pip install -e ../bionix-db        # the project now uses your local working copy
+# ...develop and test...
+pip uninstall -y bionixdb && pip install -r requirements.txt   # back to the pinned release
+```
+
 # BionixDB Library Functions
 
 ## Access Levels
