@@ -139,22 +139,33 @@ def list_files_in_shared_drive(service, drive_id: str, folder_id: str) -> list[d
         folder_id:   ID of the folder.
 
     Returns:
-        List of file metadata dicts.
+        List of file metadata dicts — every file in the folder. Drive returns at
+        most one page (≤1000 files) per request, so this follows nextPageToken
+        until all pages are read; stopping at the first page silently drops older
+        datasets once a folder grows past it.
     """
-    results = (
-        service.files()
-        .list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            corpora="drive",
-            driveId=drive_id,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
-            orderBy="modifiedTime desc",
+    files = []
+    page_token = None
+    while True:
+        results = (
+            service.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                corpora="drive",
+                driveId=drive_id,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
+                orderBy="modifiedTime desc",
+                pageSize=1000,
+                pageToken=page_token,
+            )
+            .execute()
         )
-        .execute()
-    )
-    return results.get("files", [])
+        files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            return files
 
 
 def search_files(service, query_term: str, drive_id: str = None) -> list[dict]:
