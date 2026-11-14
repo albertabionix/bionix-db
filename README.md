@@ -89,7 +89,7 @@ session = db.get_session(pid=1, action=Action.WALKING)          # trial=None -> 
 session = db.get_session(pid=1, action=Action.WALKING, trial=2) # a specific trial
 emg_df = session.get("emg")  # None if EMG wasn't recorded for that trial
 ```
-`pid` accepts an int (`1` -> `p001`) or the zero-padded string (`"p001"`). `trial` accepts an int (`1` -> `01`) or a string. For `get_session`, "latest trial" means the highest trial number found in *any* modality for that pid/action, not only the modalities in the result.
+`pid` accepts an int (`1` -> `p001`) or the zero-padded string (`"p001"`). `trial` accepts an int (`1` -> `01`) or a string. For `get_session`, "latest trial" means the highest trial number found in *any* modality for that pid/action (and exercise, if you pass one), not only the modalities in the result. Since each exercise has its own trial sequence, pass `exercise=` to get the latest trial of a specific exercise.
 
 ### What the DataFrame looks like
 Every matching file is stacked into one long DataFrame, sorted by (pid, action, exercise, trial). Five metadata columns from the filename come first, followed by the file's own columns, unchanged:
@@ -127,26 +127,43 @@ db.download("cvkas", "data/", pid="p002")
 `download_imu` and `download_cvkas` also exist. They take the same filters as the `get_*` functions.
 
 ## Uploading data
-Uploading requires `CONTENT_MANAGER` access. The local CSV's filename doesn't matter — `upload_*` names the uploaded file itself per the convention below, automatically assigning the next trial number for that participant/action.
+Uploading requires `CONTENT_MANAGER` access. The local CSV's filename doesn't matter — `upload_*` names the uploaded file itself per the convention below, automatically assigning the next trial number (see [How trial numbers are assigned](#how-trial-numbers-are-assigned)).
 
 ```python
 db.upload_emg("local_emg_recording.csv", pid=1, action=Action.WALKING)   # -> emg-p001-walking-01.csv
 db.upload_emg("local_emg_recording.csv", pid=1, action=Action.WALKING)   # -> emg-p001-walking-02.csv
 db.upload_imu("local_imu_recording.csv", pid=1, action=Action.WALKING)
 db.upload_cvkas("local_cvkas_recording.csv", pid=1, action=Action.WALKING)
+
+# With an exercise (sub-activity), which becomes part of the name:
+db.upload_emg("local_emg_recording.csv", pid=20, action=Action.STAIRS, exercise="stairmaster")  # -> emg-p020-stairs-stairmaster-01.csv
 ```
 
 When multiple modalities are recorded for the same physical trial, prefer `upload_session` over calling `upload_emg`/`upload_imu`/`upload_cvkas` independently — it assigns one shared trial number across whichever modalities are passed in (any subset of `emg`/`imu`/`cvkas`), so they can't drift out of alignment if one modality is uploaded later or skipped for a trial:
 
 ```python
 db.upload_session(
-    pid=1, action=Action.WALKING,
+    pid=1, action=Action.WALKING, exercise="r_leg",
     emg="local_emg_recording.csv",
     imu="local_imu_recording.csv",
     # cvkas omitted — not every trial needs all three modalities.
 )
 ```
-The shared trial number is one past the highest trial number found across *all* modality folders for that pid/action (not just the ones being uploaded), so a session that only ever records EMG+IMU won't reuse a trial number CVKAS already used independently.
+The shared trial number is one past the highest trial number found across *all* modality folders (not just the ones being uploaded), so a session that only ever records EMG+IMU won't reuse a trial number CVKAS already used independently.
+
+### How trial numbers are assigned
+Each exercise has its own trial sequence. The next trial is one past the highest existing trial for the same **pid + action + exercise**:
+
+| Existing files (pid `p001`, action `walking`) | Upload with | New trial |
+|---|---|---|
+| `…-walking-r_leg-01`, `…-walking-r_leg-02` | `exercise="r_leg"` | `03` |
+| same | `exercise="l_leg"` | `01` (no `l_leg` files yet) |
+| `…-walking-01` (no exercise), `…-walking-baseline-05` | `exercise="baseline"` | `06` |
+| any of the above | no exercise | one past the highest trial of *any* exercise for that pid/action |
+
+- `upload()` (one modality) looks at that modality's folder only.
+- `upload_session()` looks at all three modality folders, so the files it uploads always share one trial number.
+- Files named without an exercise (from before exercises were added) only count toward uploads made without an exercise.
 
 Uploads (`upload`/`upload_session`) are rejected (before touching the Drive) if:
 - The caller does not have `CONTENT_MANAGER` access (`PermissionError`)
@@ -162,7 +179,7 @@ Uploads (`upload`/`upload_session`) are rejected (before touching the Drive) if:
 - `pid`: zero-padded participant id, e.g. `p001`
 - `action`: one of `seated`, `walking`, `sitstand`, `stairs` (see `ACTION_NAMES` in `bionixdb.py`)
 - `exercise` (optional): free-text sub-activity, e.g. `stairmaster`. `-` is replaced with `_` so the name stays parseable; a blank exercise is treated as none
-- `trial`: zero-padded trial number, e.g. `01` — assigned automatically by `upload()` as one past the highest existing trial for that modality/pid/action; never chosen by the caller
+- `trial`: zero-padded trial number, e.g. `01`, assigned automatically on upload and never chosen by the caller. Numbering is per pid/action/exercise; see [How trial numbers are assigned](#how-trial-numbers-are-assigned)
 
 Examples: `emg-p001-walking-01.csv`, `emg-p020-stairs-stairmaster-03.csv`
 
