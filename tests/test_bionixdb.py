@@ -653,3 +653,44 @@ def test_trial_numbering_ignores_google_sheets_copies(monkeypatch):
 def test_parse_name_requires_csv_extension():
     assert BionixDB._parse_name("emg-p006-seated-01.csv") is not None
     assert BionixDB._parse_name("emg-p006-seated-01") is None
+
+
+# ---------------------------------------------------------------------------
+# oauth.py interactive demo (python -m bionix_db.oauth)
+# ---------------------------------------------------------------------------
+
+def test_oauth_demo_lists_shared_drive_root_and_folders(monkeypatch, tmp_path):
+    from bionix_db import oauth
+
+    monkeypatch.chdir(tmp_path)  # no local credentials.json here
+    used_credentials = []
+    monkeypatch.setattr(oauth, "authenticate", lambda creds, *a, **k: used_credentials.append(creds))
+    monkeypatch.setattr(oauth, "build_service", lambda creds: MagicMock())
+    monkeypatch.setattr(oauth, "list_shared_drives", lambda service: [{"id": "drive1", "name": "Bionix"}])
+    listed = []
+    monkeypatch.setattr(oauth, "list_files_in_shared_drive",
+                        lambda service, drive_id, folder_id: listed.append((drive_id, folder_id)) or [])
+    answers = iter(["4", "folderX", "0"])  # list a folder, then exit
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    oauth.main()
+
+    assert used_credentials == [str(oauth.BUNDLED_CREDENTIALS_FILE)]
+    assert listed == [("drive1", "drive1"), ("drive1", "folderX")]  # drive root, then the folder
+
+
+def test_oauth_demo_prefers_local_credentials(monkeypatch, tmp_path):
+    from bionix_db import oauth
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "credentials.json").write_text("{}")
+    used_credentials = []
+    monkeypatch.setattr(oauth, "authenticate", lambda creds, *a, **k: used_credentials.append(creds))
+    monkeypatch.setattr(oauth, "build_service", lambda creds: MagicMock())
+    monkeypatch.setattr(oauth, "list_shared_drives", lambda service: [])
+    monkeypatch.setattr(oauth, "list_files", lambda service, **k: [])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "0")
+
+    oauth.main()
+
+    assert used_credentials == ["credentials.json"]

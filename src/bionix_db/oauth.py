@@ -5,13 +5,14 @@ Google Drive OAuth2 Access
 Authenticates via OAuth 2.0 and provides utilities to interact
 with a shared Google Drive (list, download, upload, search files).
 
-Setup:
-  1. pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
-  2. Create a project in Google Cloud Console (https://console.cloud.google.com)
-  3. Enable the Google Drive API
-  4. Create OAuth 2.0 credentials (Desktop App) and download as credentials.json
-  5. Place credentials.json in the same directory as this script
-  6. Run: python google_drive_oauth.py
+Interactive demo (lists your Shared Drives and their files, and lets you
+search, download and upload):
+
+    python -m bionix_db.oauth
+
+It uses the OAuth client bundled with the package, like BionixDB does, unless a
+credentials.json exists in the current directory. The login token is saved to
+token.json in the current directory.
 """
 
 import os
@@ -34,6 +35,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"] # Full Drive access
 
 CREDENTIALS_FILE = "credentials.json"   # Downloaded from Google Cloud Console
+# OAuth client shipped with the package (same file BionixDB falls back to).
+BUNDLED_CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
 TOKEN_FILE = "token.json"               # Created automatically after first login
 DOWNLOAD_DIR = Path("downloads")        # Local folder for downloaded files
 
@@ -341,7 +344,9 @@ def main():
 
     # 1. Authenticate
     print("\n🔐 Authenticating…")
-    creds   = authenticate()
+    # A local credentials.json takes priority; otherwise use the bundled client.
+    credentials = CREDENTIALS_FILE if os.path.exists(CREDENTIALS_FILE) else str(BUNDLED_CREDENTIALS_FILE)
+    creds   = authenticate(credentials)
     service = build_service(creds)
     print("✅ Authenticated successfully.\n")
 
@@ -359,7 +364,8 @@ def main():
     if shared_drives:
         drive_id = shared_drives[0]["id"]
         print(f"  (from Shared Drive: '{shared_drives[0]['name']}')")
-        files = list_files_in_shared_drive(service, drive_id)
+        # A Shared Drive's root folder has the same ID as the drive itself.
+        files = list_files_in_shared_drive(service, drive_id, drive_id)
     else:
         drive_id = None
         files = list_files(service)
@@ -410,7 +416,11 @@ def main():
 
         elif choice == "4":
             fid = input("Folder ID: ").strip()
-            folder_files = list_files(service, folder_id=fid)
+            # list_files() only sees My Drive; Shared Drive folders need the drive's listing.
+            if drive_id:
+                folder_files = list_files_in_shared_drive(service, drive_id, fid)
+            else:
+                folder_files = list_files(service, folder_id=fid)
             print_files(folder_files)
 
         else:
