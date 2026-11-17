@@ -58,6 +58,8 @@ _BUNDLED_CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
 
 BIONIX_DRIVE_ID = "0APjSE_uRDqsCUk9PVA"
 
+CSV_MIME_TYPE = "text/csv"
+
 MODALITY_FOLDERS = {
     "emg":   "1Sw_uLumdZ7xvpO3VHwfvgb60IEsWo5Oe",
     "imu":   "1FwzB_WrpIWwz8rOVqm_r5Z1V3ZvtFFy_",
@@ -229,7 +231,12 @@ class BionixDB:
     @staticmethod
     def _parse_name(name: str) -> dict | None:
         """Split '{modality}-{pid}-{action}[-{exercise}]-{trial}.csv' into its parts,
-        or None if the name doesn't follow the convention."""
+        or None if the name doesn't follow the convention.
+
+        The .csv extension is required: a file such as 'emg-p006-seated-01' with no
+        extension is a Google Sheets copy someone made of a recording, not a dataset."""
+        if not name.endswith(".csv"):
+            return None
         parts = name.removesuffix(".csv").split("-")
         if len(parts) not in (4, 5):
             return None
@@ -248,6 +255,12 @@ class BionixDB:
 
         matches = []
         for f in all_files:
+            # Only real CSV files are datasets. The dataset folders can also hold
+            # Google Sheets copies of recordings, which can't be downloaded as files
+            # (Drive returns 403 "fileNotDownloadable") and would otherwise be counted
+            # as trials. Every upload is stored as text/csv.
+            if f.get("mimeType", CSV_MIME_TYPE) != CSV_MIME_TYPE:
+                continue
             meta = self._parse_name(f["name"])
             if meta is None or meta["modality"] != modality:
                 continue
@@ -430,7 +443,7 @@ class BionixDB:
             filename = f"{modality}-{self._format_pid(pid)}-{action_name}-{trial:02d}.csv"
 
         metadata = {"name": filename, "parents": [folder_id]}
-        media = MediaFileUpload(str(csv_path), mimetype="text/csv", resumable=True)
+        media = MediaFileUpload(str(csv_path), mimetype=CSV_MIME_TYPE, resumable=True)
 
         file = self.service.files().create(
             body=metadata,

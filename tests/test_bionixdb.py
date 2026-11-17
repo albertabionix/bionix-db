@@ -603,3 +603,53 @@ def test_list_files_in_shared_drive_follows_all_pages():
     assert [f["id"] for f in files] == ["1", "2", "3", "4"]
     tokens = [c.kwargs["pageToken"] for c in service.files.return_value.list.call_args_list]
     assert tokens == [None, "p2", "p3"]
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets copies in the dataset folders
+# ---------------------------------------------------------------------------
+# The real Drive has Sheets copies of some recordings, e.g. "emg-p006-seated-01"
+# (no extension, mimeType application/vnd.google-apps.spreadsheet). They can't be
+# downloaded as files, so they must be ignored everywhere.
+
+SHEET = "application/vnd.google-apps.spreadsheet"
+FILES_WITH_SHEETS = [
+    {"id": "csv1", "name": "emg-p006-seated-01.csv", "mimeType": "text/csv"},
+    {"id": "sheet1", "name": "emg-p006-seated-01", "mimeType": SHEET},
+    {"id": "sheet2", "name": "emg-p006-seated-16", "mimeType": SHEET},
+    {"id": "sheet3", "name": "emg-p006-seated-02.csv", "mimeType": SHEET},  # renamed to look like a CSV
+    {"id": "sample", "name": "sample-emg", "mimeType": SHEET},
+]
+
+
+def test_get_ignores_google_sheets_copies(monkeypatch):
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: FILES_WITH_SHEETS)
+    db = make_db()
+    stub_downloads(db, {"csv1": EMG_CSV["e1"]})  # downloading a Sheet would raise KeyError
+
+    df = db.get_emg(pid=6)
+
+    assert set(df["file"]) == {"emg-p006-seated-01.csv"}
+    assert db._download_bytes.call_count == 1
+
+
+def test_download_ignores_google_sheets_copies(monkeypatch, tmp_path):
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: FILES_WITH_SHEETS)
+    db = make_db()
+    stub_downloads(db, {"csv1": EMG_CSV["e1"]})
+
+    paths = db.download_emg(tmp_path, pid="p006")
+
+    assert [p.name for p in paths] == ["emg-p006-seated-01.csv"]
+
+
+def test_trial_numbering_ignores_google_sheets_copies(monkeypatch):
+    # A Sheets copy named "...-16" must not push the next real trial number to 17.
+    monkeypatch.setattr(bionixdb, "list_files_in_shared_drive", lambda *a, **k: FILES_WITH_SHEETS)
+    db = make_db()
+    assert db._latest_trial(6, "seated") == 1
+
+
+def test_parse_name_requires_csv_extension():
+    assert BionixDB._parse_name("emg-p006-seated-01.csv") is not None
+    assert BionixDB._parse_name("emg-p006-seated-01") is None
